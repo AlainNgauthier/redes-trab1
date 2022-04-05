@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import asyncio
-from tcp import Servidor
+from typing import AnyStr, Dict, List, Mapping, Optional, Set
+from grader.tcp import Servidor, Conexao
+from functools import partial
 import re
 
 
@@ -8,22 +10,144 @@ def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 
-def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+class Connections:
+    def __init__(self):
+        self._conn: Dict[bytes, Conexao] = {}
+        self._channels: Dict[bytes, Set[bytes]] = {}
 
+    def sair(self, conexao: Conexao):
+        command_pool = []
+        for channel_key in self._channels:
+            if conexao.nick in self._channels[channel_key]:
+                for nick in self._channels[channel_key]:
+                    if nick != conexao.nick:
+                        command_pool.append(nick)
+                self._channels[channel_key].remove(conexao.nick)
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+        for nick in command_pool:
+            self._conn[nick].enviar(
+                b':%s QUIT :Connection closed\r\n' % conexao.nick
+            )
+        if conexao.nick != b'*':
+            self._conn.pop(conexao.nick)
+        conexao.fechar()
 
+    def conexao_aceita(self, conexao: Conexao):
+        conexao.registrar_recebedor(self.dados_recebidos)
 
-def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
-    conexao.registrar_recebedor(dados_recebidos)
+    def dados_recebidos(self, conexao: Conexao, dados: bytes):
+        if dados == b'':
+            return self.sair(conexao)
+        if not hasattr(conexao, 'buffer'):
+            setattr(conexao, 'buffer', dados)
+        if not hasattr(conexao, 'nick'):
+            setattr(conexao, 'nick', b'*')
 
+        if re.search(br'\n', dados) is None:
+            conexao.buffer = b'%s%s' % (conexao.buffer, dados)
+        else:
+            data, next_data = dados.split(b'\n', 1)
+            data = b'%s\n' % data
+            self.route_data(conexao, b'%s%s' % (conexao.buffer, data))
+            conexao.buffer = b''
+            if next_data != b'':
+                self.dados_recebidos(conexao, next_data)
+
+    def _privmsg(self, conexao: Conexao, nick: bytes, message: bytes):
+
+        if nick.lower() in self._conn:
+
+            self._conn[nick.lower()].enviar(b':%s PRIVMSG %s :%s\r\n' % (
+                conexao.nick,
+                nick,
+                message)
+            )
+
+        if nick.lower() in self._channels:
+            for channel_nick in self._channels[nick.lower()]:
+                if channel_nick.lower() != conexao.nick.lower():
+                    self._conn[channel_nick.lower()].enviar(b':%s PRIVMSG %s :%s\r\n' % (
+                        conexao.nick,
+                        nick,
+                        message)
+                    )
+
+    def _ping(self, conexao: Conexao, user: bytes):
+        conexao.enviar(b':server PONG server :%s\r\n' % user)
+
+    def _nick(self, conexao: Conexao, nick: bytes):
+        if not validar_nome(nick):
+            conexao.enviar(b':server 432 %s %s :Erroneous nickname\r\n' % (
+                conexao.nick,
+                nick)
+            )
+        elif nick.lower() in self._conn:
+            conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' % (
+                conexao.nick,
+                nick)
+            )
+        else:
+            if conexao.nick != b'*':
+                conexao.enviar(b':%s NICK %s\r\n' % (conexao.nick, nick))
+                self._conn[nick.lower()] = self._conn.pop(conexao.nick)
+            else:
+                conexao.enviar(b':server 001 %s :Welcome\r\n' % nick)
+                conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nick)
+                self._conn[nick.lower()] = conexao
+            self._conn[nick.lower()].nick = nick
+
+    def _join(self, conexao: Conexao, channel: bytes):
+        if channel not in self._channels:
+            self._channels[channel] = set()
+            self._channels[channel].add(conexao.nick)
+        else:
+            self._channels[channel].add(conexao.nick)
+        for nick in self._channels[channel]:
+            self._conn[nick].enviar(b':%s JOIN :%s\r\n' % (conexao.nick, channel))
+        conexao.enviar(b':server 353 %s = %s :%s\r\n' % (conexao.nick, channel, b' '.join(
+            sorted(list(self._channels[channel]))
+        )))
+        conexao.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (conexao.nick, channel))
+
+    def _part(self, conexao: Conexao, channel: bytes):
+        if channel.lower() in self._channels:
+            for channel_nick in self._channels[channel.lower()]:
+                self._conn[channel_nick.lower()].enviar(b':%s PART %s\r\n' % (
+                    conexao.nick,
+                    channel)
+                )
+            self._channels[channel.lower()].remove(conexao.nick)
+
+    def route_data(self, conexao: Conexao, data: bytes):
+        matches_ping = re.search(br'PING (.*)\r\n', data)
+        if matches_ping is not None:
+            self._ping(conexao, matches_ping.group(1))
+
+        matches_nick = re.search(br'NICK (.*)\r\n', data)
+        if matches_nick is not None:
+            nick = matches_nick.group(1)
+            self._nick(conexao, nick)
+
+        matches_privmg = re.search(
+            br'^PRIVMSG ([\#]?[a-zA-Z][a-zA-Z0-9_-]*) :(.*)\r\n$',
+            data
+        )
+        if matches_privmg is not None:
+            nick = matches_privmg.group(1)
+            message = matches_privmg.group(2)
+            self._privmsg(conexao, nick, message)
+
+        matches_join = re.search(br'JOIN (.*)\r\n', data)
+        if matches_join is not None:
+            channel = matches_join.group(1)
+            self._join(conexao, channel)
+
+        matches_part = re.search(br'PART (.*)\r\n', data)
+        if matches_part is not None:
+            channel = matches_part.group(1).split(b' :')[0]
+            self._part(conexao, channel)
 
 servidor = Servidor(6667)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+conexoes = Connections()
+servidor.registrar_monitor_de_conexoes_aceitas(conexoes.conexao_aceita)
 asyncio.get_event_loop().run_forever()
